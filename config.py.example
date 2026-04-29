@@ -1,0 +1,37 @@
+"""
+설정 파일 샘플 (config.py.example)
+이 파일을 config.py로 복사한 뒤 실제 API 키를 입력하세요.
+"""
+
+# 1. 바이비트(Bybit) API 설정
+BYBIT_API_KEY = "YOUR_BYBIT_API_KEY"
+BYBIT_API_SECRET = "YOUR_BYBIT_API_SECRET"
+BYBIT_SECRET = BYBIT_API_SECRET
+
+# 2. 텔레그램(Telegram) 설정
+TELEGRAM_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+TELEGRAM_CHAT_ID = "YOUR_CHAT_ID"
+TELEGRAM_BOT_TOKEN = TELEGRAM_TOKEN
+
+# 3. DB 설정
+DB_PATH = "trading_bot.db"
+
+# 4. 전략 설정 클래스 및 상세 설정
+class StrategyConfig:
+    def __init__(self, name, risk_per_trade_usdt, max_open_positions,
+                 top_volume_count, default_leverage, cooldown_minutes=60):
+        self.name = name
+        self.risk_per_trade_usdt = risk_per_trade_usdt
+        self.max_open_positions = max_open_positions
+        self.top_volume_count = top_volume_count
+        self.default_leverage = default_leverage
+        self.cooldown_minutes = cooldown_minutes
+
+STRATEGY_B = StrategyConfig(
+    name="StrategyB",
+    risk_per_trade_usdt=3,
+    max_open_positions=3,
+    top_volume_count=40,
+    default_leverage=20,
+    cooldown_minutes=0
+)
