@@ -8,6 +8,7 @@ import time
 import warnings
 from datetime import datetime, timezone
 import numpy as np
+import torch as th
 import pandas as pd
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
@@ -25,9 +26,9 @@ warnings.filterwarnings("ignore")
 # ==============================================================================
 # [V34] Grand Finale Rank 1 Champion Live Engine (Score 111.7)
 # ==============================================================================
-MAX_POSITIONS = 3        # [Surgical Edit] 5 -> 3개로 압축 (정예병 운용)
-ALLOCATION_RATE = 0.30   # [Surgical Edit] 0.15 -> 0.30 (타격 비중 확대)
-LEVERAGE = 2             # 💡 절대 방어: 2배 고정 레버리지 적용 (지혈 모드)
+MAX_POSITIONS = 1        # [Surgical Edit] 단 1종목 집중 저격 (최고 확신도 올인)
+ALLOCATION_RATE = 0.95   # [Surgical Edit] 가용 잔고의 95% 투입 (수수료 버퍼 5%)
+LEVERAGE = 3             # [Surgical Edit] 3배 레버리지
 TIMEFRAME = "5m"         
 TF_MINUTES = 5
 
@@ -253,79 +254,104 @@ class V33LiveBot:
                 logger.info(f"🌙 [5m Boundary] 데이터 동기화 및 사냥 시작 (현재: {len(self.positions)}/{MAX_POSITIONS})")
                 await self.exchange.exchange.load_markets()
 
+                # ── Phase 1: 전 코인 스캔 - 1.0 신호 후보 및 원시 확신도 수집 ──
+                candidates = []  # (ticker, raw_score)
                 for ticker in FULL_UNIVERSE[:50]:
-                    await asyncio.sleep(0.1) # API 과속 방지 (Rate Limit 보호)
+                    await asyncio.sleep(0.1) # API 과속 방지
                     if not await self.fetch_missing_5m_data(ticker): continue
                     try:
                         obs = await self.get_v33_observation(ticker)
                         action, _ = self.model.predict(obs, deterministic=True)
                         act_val = float(action[0])
-                        
+
                         if ticker in self.positions:
-                            # ... (반전 청산 로직 유지) ...
+                            # [Surgical Edit] 이산형 모델에 맞춘 긴급 탈출 로직
+                            # 롱(Long)을 들고 있는데 AI가 2.0(Short/하락)을 외치면 즉각 도망칩니다!
                             pos = self.positions[ticker]
-                            if (pos["side"] == "long" and act_val < -0.1) or (pos["side"] == "short" and act_val > 0.1):
-                                await self.exchange.close_position_market(ticker_to_symbol(ticker), 
+                            if pos["side"] == "long" and act_val == 2.0:
+                                await self.exchange.close_position_market(ticker_to_symbol(ticker),
                                     None, pos["amount"], f"Flip_{ticker}_{int(time.time())}", position_side=pos["side"])
                                 del self.positions[ticker]; self._save_state()
-                                await self.telegram.send_message(f"🔴 **[{ticker}]** 시그널 반전 청산")
-                        elif len(self.positions) < MAX_POSITIONS:
-                            # [IMMUTABLE CORE] v34_train.step()과 100% 동일한 액션 해석
-                            # Box[-1,1] 공간에서 1.0(상한 포화) = 롱, 2.0은 범위 초과로 실행 불가
-                            # → V34 모델은 롱 전용 스나이퍼. 숏은 V35 훈련 시 도입 예정.
-                            if act_val == 1.0:
-                                signal = "long"
-                            elif act_val == 2.0:  # Box[-1,1] 초과 → 훈련과 동일하게 실행 불가
-                                signal = "short"
-                            else:
-                                continue  # 0.0 포함 나머지 모든 값 = 관망
+                                await self.telegram.send_message(f"🔴 **[{ticker}]** 하락 위험(2.0) 감지! 롱 포지션 긴급 청산")
 
-                            # [Surgical Edit] 총 자산과 가용 자산 교차 검증
-                            equity = await self.exchange.get_total_equity()
-                            available = await self.exchange.get_available_balance()
-                            
-                            # 가용 자산의 80%만 사용하여 수수료/슬리피지 버퍼 확보
-                            margin = min(equity * ALLOCATION_RATE, available * 0.8)
-                            if margin < 1.0:
-                                logger.warning(f"💰 [Balance Guard] 가용 잔고($ {available:.2f}) 부족으로 사냥 중단")
-                                break
-                            
-                            symbol = ticker_to_symbol(ticker)
-                            tick = await self.exchange.fetch_ticker(symbol)
-                            curr_px = float(tick['last'])
-                            
-                            # [Surgical Edit] 차등 레버리지 삭제 및 극강의 방어력(2배 고정) 적용
-                            current_leverage = 2
-                            
-                            raw_amount = (margin * current_leverage) / curr_px
-                            amount = self.exchange.format_amount(symbol, raw_amount)
-                            min_amount = await self.exchange.fetch_market_min_amount(symbol)
-                            if amount < min_amount: continue
-                            
-                            ohlcv = await self.exchange.fetch_ohlcv(symbol, "5m", limit=30)
-                            df_atr = pd.DataFrame(ohlcv, columns=['t','o','h','l','c','v'])
-                            atr = (df_atr['h'] - df_atr['l']).rolling(14).mean().iloc[-1]
-                            sl_px = (curr_px - SL_ATR_COEF * atr) if signal == "long" else (curr_px + SL_ATR_COEF * atr)
-                            
-                            if not self.is_dry_run:
-                                try:
-                                    order = await self.exchange.place_order_with_sl(symbol, "buy" if signal=="long" else "sell", 
-                                        amount, f"V33_{ticker}_{int(time.time())}", current_leverage, sl_px, position_side=signal)
-                                    
-                                    if order:
-                                        self.positions[ticker] = {"side": signal, "amount": amount, "entry_price": curr_px, "entry_timestamp": time.time(), "mfe": 0.0}
-                                        self._save_state()
-                                        
-                                        msg = f"🟢 **[V34 롱 진입]** {ticker} @ {curr_px:.4f} (Score: {act_val:.5f})"
-                                        await self.telegram.send_message(msg)
-                                        logger.info(f"🚀 [{ticker}] 사냥 개시! (Score: {act_val:.5f})")
-                                except Exception as e:
-                                    if "110007" in str(e) or "not enough" in str(e).lower():
-                                        logger.warning(f"💰 [Balance Guard] {ticker} 진입 실패: 잔고 부족.")
-                                        break
-                                    else:
-                                        logger.error(f"🚨 [{ticker}] 주문 실패: {e}")
+                        elif len(self.positions) < MAX_POSITIONS and act_val == 1.0:
+                            # [IMMUTABLE CORE] v34_train과 동일: act_val == 1.0 = 롱 신호
+
+                            # [Surgical Edit] Tensor Device 할당 및 이산형 모델의 확률(Probs) 추출
+                            # obs_tensor를 모델이 위치한 디바이스(CPU/GPU)로 정확히 올려줍니다.
+                            obs_tensor = th.tensor(obs, dtype=th.float32).to(self.model.device)
+
+                            with th.no_grad():
+                                dist = self.model.policy.get_distribution(obs_tensor)
+                                # Categorical 분포에서 각 액션(0,1,2) 확률표(.probs)를 가져옵니다.
+                                # shape=(1,3), 인덱스 1 = 롱(Long) 확신도
+                                probs = dist.distribution.probs
+                                raw_score = float(probs[0, 1].item())
+
+                            candidates.append((ticker, raw_score))
+                            logger.info(f"🎯 [{ticker}] 후보 등록 (Long 확신도: {raw_score*100:.2f}%)") 
+
                     except Exception as e: logger.error(f"[{ticker}] 오류: {e}")
+
+                # ── Phase 2: 최고 확신도 단 1종목에 올인 ──
+                if candidates and len(self.positions) < MAX_POSITIONS:
+                    # [리포트] 상위 5개 후보를 Long 확신도(%) 순으로 정렬하여 보고
+                    sorted_candidates = sorted(candidates, key=lambda x: x[1], reverse=True)
+                    top5 = sorted_candidates[:5]
+                    
+                    top5_log = "\n".join([f"  {i+1}. {t} | Long 확신도: {s*100:.2f}%" for i, (t, s) in enumerate(top5)])
+                    logger.info(f"📊 [Top-5 Long 확신도 랭킹]\n{top5_log}")
+                    
+                    top5_msg = "📊 **[Top-5 Long 확신도 랭킹]**\n" + "\n".join(
+                        [f"{'🥇' if i==0 else '🥈' if i==1 else '🥉' if i==2 else f'{i+1}위'} `{t}` → `{s*100:.2f}%`"
+                         for i, (t, s) in enumerate(top5)]
+                    )
+                    await self.telegram.send_message(top5_msg)
+
+                    best_ticker, best_score = sorted_candidates[0]
+                    logger.info(f"🏆 최고 확신도 타겟: {best_ticker} ({best_score*100:.2f}%) / 후보 {len(candidates)}개 중 선발")
+                    await self.telegram.send_message(f"🔍 **[스캔 완료]** {len(candidates)}개 후보 중 **{best_ticker}** 선발 (Long 확신도: {best_score*100:.2f}%)")
+
+                    try:
+                        equity    = await self.exchange.get_total_equity()
+                        available = await self.exchange.get_available_balance()
+                        margin    = min(equity * ALLOCATION_RATE, available * 0.95)
+                        if margin < 1.0:
+                            logger.warning(f"💰 [Balance Guard] 가용 잔고($ {available:.2f}) 부족으로 사냥 중단")
+                        else:
+                            symbol = ticker_to_symbol(best_ticker)
+                            tick   = await self.exchange.fetch_ticker(symbol)
+                            curr_px = float(tick['last'])
+                            current_leverage = LEVERAGE
+
+                            raw_amount = (margin * current_leverage) / curr_px
+                            amount     = self.exchange.format_amount(symbol, raw_amount)
+                            min_amount = await self.exchange.fetch_market_min_amount(symbol)
+
+                            if amount >= min_amount:
+                                ohlcv  = await self.exchange.fetch_ohlcv(symbol, "5m", limit=30)
+                                df_atr = pd.DataFrame(ohlcv, columns=['t','o','h','l','c','v'])
+                                atr    = (df_atr['h'] - df_atr['l']).rolling(14).mean().iloc[-1]
+                                sl_px  = curr_px - SL_ATR_COEF * atr  # 롱 전용
+
+                                if not self.is_dry_run:
+                                    order = await self.exchange.place_order_with_sl(
+                                        symbol, "buy", amount,
+                                        f"V34_{best_ticker}_{int(time.time())}",
+                                        current_leverage, sl_px, position_side="long"
+                                    )
+                                    if order:
+                                        self.positions[best_ticker] = {"side": "long", "amount": amount, "entry_price": curr_px, "entry_timestamp": time.time(), "mfe": 0.0}
+                                        self._save_state()
+                                        msg = (f"🟢 **[V34 최고확신도 진입]** {best_ticker} @ {curr_px:.4f}\n"
+                                               f"Long 확신도: {best_score*100:.2f}% | 레버리지: {current_leverage}x | 증거금: ${margin:.2f}")
+                                        await self.telegram.send_message(msg)
+                                        logger.info(f"🚀 [{best_ticker}] 사냥 개시! (Long 확신도: {best_score*100:.2f}%)")
+                    except Exception as e:
+                        if "110007" in str(e) or "not enough" in str(e).lower():
+                            logger.warning(f"💰 [Balance Guard] 진입 실패: 잔고 부족.")
+                        else:
+                            logger.error(f"🚨 [{best_ticker}] 주문 실패: {e}")
 
                 await asyncio.sleep(10)
             except Exception as e: logger.error(f"🛑 오류: {e}"); await asyncio.sleep(30)
