@@ -1,5 +1,9 @@
 # 🚀 Bybit PPO Universal Trading Bot
 
+> [!IMPORTANT]
+> **V33 전이학습 수행 전 필독**: [V33 디버깅 사후 보고서](C:\Users\zpwkg\.gemini\antigravity\knowledge\v33_debugging\artifacts\v33_debug_postmortem.md)를 먼저 확인하세요.
+> h1_ema_200 필터 문제 및 Windows 멀티프로세싱 CSV 충돌 방지 로직이 포함되어 있습니다.
+
 Bybit 거래소 기반의 강화학습(PPO) 퀀트 트레이딩 봇 프로젝트입니다. 2020년부터 현재까지의 빅데이터를 활용하여 멀티 코인(50종)에 대한 범용 알파(Universal Alpha) 모델을 훈련하고 실전 매매를 수행합니다.
 
 ## 📌 주요 버전 및 히스토리
@@ -7,7 +11,8 @@ Bybit 거래소 기반의 강화학습(PPO) 퀀트 트레이딩 봇 프로젝트
 *   **V29 (Live)**: `v29_bybit_live.py` - 현재 실전 매매를 담당하는 피닉스 엔진입니다. 동적 비중 조절 및 스왑 로직이 포함되어 있습니다.
 *   **V30 (Curriculum)**: 단계별 커리큘럼 학습(BTC/ETH -> Top15 -> 50종)을 도입한 초기 대함대 훈련 엔진입니다.
 *   **V31 (Data)**: `v31_full_history_scraper.py` - 2020년부터의 5분봉 풀 히스토리 데이터를 수집하는 엔진입니다.
-*   **V32 (Current Training)**: `v32_train_from_scratch.py` - 시계열 분할(Time-Series Split)을 적용하여 2026년 장세에 최적화된 모델을 백지상태에서 훈련하는 최신 엔진입니다.
+*   **V32**: `v32_train_from_scratch.py` - 시계열 분할(Time-Series Split)을 적용하여 2026년 장세에 최적화된 모델을 백지상태에서 훈련하는 최신 엔진입니다.
+*   **V33 (Transfer Learning)**: `v33_2_transfer_learning.py` - V30의 지식을 V33 환경(풀 히스토리)으로 전이학습하여 정밀화하는 최신 엔진입니다. MAE/MFE 기반 보상 체계가 적용되었습니다.
 
 ## 📂 주요 파일 구조
 

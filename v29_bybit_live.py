@@ -30,8 +30,8 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # ==============================================================================
 # [V29 Phase 1] Multi-Coin Universal Alpha Live Engine (Phoenix Edition)
 # ==============================================================================
-MAX_POSITIONS = 10       # 🔥 [V31 동적 비중] 최대 보유 포지션 수
-ALLOCATION_RATE = 0.10   # 🔥 [V31 동적 비중] 매 진입 시 총 잔고의 10% 사용
+MAX_POSITIONS = 3       # 🔥 [V31 동적 비중] 최대 보유 포지션 수
+ALLOCATION_RATE = 0.30   # 🔥 [V31 동적 비중] 매 진입 시 총 잔고의 10% 사용
 SWAP_THRESHOLD = 0.20    # 🔄 [V31 스왑 로직] 기존 시그널 대비 20% 우위 필요
 SWAP_MIN_DIFF = 0.10     # 🔄 [V31 스왑 로직] 수수료 방어를 위한 절대적 시그널 차이 최소 0.10
 LEVERAGE = 3
@@ -569,7 +569,7 @@ class V29LiveBot:
                             time_elapsed = time.time() - pos.get("entry_timestamp", time.time())
                             pnl_pct = pnl_raw * 100.0
 
-                            if time_elapsed > 86400 and pnl_pct < 1.0:
+                            if time_elapsed > 864000 and pnl_pct < 1.0:
                                 logger.info(f"⏳ [{ticker}] 시간초과 발동! (24시간 경과, 현재 손익률: {pnl_pct:.2f}%, 수익 미달)")
                                 await self.safe_market_close(ticker, "Time_Stop")
                                 continue
@@ -616,10 +616,18 @@ class V29LiveBot:
                                     for f_idx in range(4):
                                         test_stacked[0, (f_idx + 1) * 37 - 1] = float(cid)
                                     t_action, _ = self.model.predict(test_stacked, deterministic=True)
-                                    logger.info(f"🔬 [Embedding Test] Coin ID {cid} -> Prediction: {float(t_action[0]):.4f}")
+                                    raw_t = float(t_action[0])
+                                    _c = float(np.clip(raw_t, -0.9999, 0.9999))
+                                    scaled_t = float(np.tanh(np.arctanh(_c) * 0.25))
+                                    logger.info(f"🔬 [Embedding Test] Coin ID {cid} -> Prediction: {scaled_t:.4f} (raw: {raw_t:.4f})")
 
                             action, _ = self.model.predict(stacked_obs, deterministic=True)
-                            act_val = float(action[0])
+                            raw_act = float(action[0])
+                            # [Desaturation] arctanh → scale → tanh 변환
+                            # 포화된 ±1 근방 신호를 전체 범위로 펼칩니다.
+                            # scale=0.25: 0.9999 → ±0.756, 0.999 → ±0.718, 0.99 → ±0.634
+                            _clipped = float(np.clip(raw_act, -0.9999, 0.9999))
+                            act_val = float(np.tanh(np.arctanh(_clipped) * 0.25))
 
                             signal = "WAIT"
                             if act_val > 0.05: signal = "LONG"

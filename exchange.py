@@ -21,7 +21,7 @@ class ExchangeClient:
             'secret': secret or BYBIT_API_SECRET,
             'enableRateLimit': True,
             'options': {
-                'defaultType': 'future',
+                'defaultType': 'linear',              # 💡 USDT 무기한 선물(Linear) 모드로 고정
                 'adjustForTimeDifference': True,  # 💡 CCXT 자체 시차 보정 활성화
                 'recvWindow': 60000,              # 💡 바이비트 허용 오차를 60초로 대폭 확장
             }
@@ -44,9 +44,14 @@ class ExchangeClient:
                 logger.warning(f"⚠️ 시간 동기화 시도 중 에러 발생 (무시하고 진행): {e}")
 
     async def fetch_balance(self):
-        await self._sync_time_if_needed() # 개인정보 요청 전 시계열 확인
-        try: return await self.exchange.fetch_balance()
+        try:
+            return await self.exchange.fetch_balance()
         except Exception as e:
+            if "10002" in str(e):
+                logger.warning("🕒 [Exchange] 서버 시차 감지! 즉시 재동기화 실행...")
+                self._time_synced = False
+                await self._sync_time_if_needed()
+                return await self.exchange.fetch_balance() # 재시도
             logger.error(f"⚠️ 잔고 조회 실패: {e}")
             return {}
 
@@ -56,21 +61,30 @@ class ExchangeClient:
             return float(bal.get('total', {}).get('USDT', 0))
         except: return 0.0
 
+    async def get_available_balance(self) -> float:
+        """현재 즉시 주문에 사용할 수 있는 가용 잔고를 조회합니다."""
+        try:
+            bal = await self.fetch_balance()
+            # 바이비트 통합/일반 계정의 가용 잔고(USDT)
+            return float(bal.get('free', {}).get('USDT', 0))
+        except: return 0.0
+
     async def fetch_ohlcv(self, symbol, timeframe='15m', since=None, limit=100):
-        """데이터 수집 실패 방지 - 최대 3회 재시도 (빈 데이터 및 예외 대응)"""
+        """데이터 수집 실패 방지 - 네트워크 에러 시에만 재시도"""
         for attempt in range(1, 4):
             try:
                 ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=limit)
+                # 빈 데이터면 거래소에 아직 데이터가 없는 것이므로 재시도 없이 즉시 반환
                 if not ohlcv or len(ohlcv) == 0:
-                    raise ValueError("Empty OHLCV data received")
+                    return []
                 return ohlcv
             except Exception as e:
+                # 실제 통신 예외 발생 시에만 재시도
                 wait_time = attempt * 2
                 if attempt < 3:
-                    logger.warning(f"⚠️ [{symbol}] 데이터 수집 시도 실패 ({attempt}/3) - {wait_time}초 후 재시도... 원인: {e}")
+                    logger.warning(f"⚠️ [{symbol}] 데이터 통신 시도 실패 ({attempt}/3) - 원인: {e}")
                     await asyncio.sleep(wait_time)
                 else:
-                    logger.error(f"🚨 [{symbol}] 데이터 수집 최종 실패 (3/3) - 원인: {e}")
                     return []
         return []
 
@@ -201,6 +215,11 @@ class ExchangeClient:
             return order
 
         except Exception as e: 
+            if "10002" in str(e):
+                logger.warning("🕒 [Exchange] 서버 시차 감지! 즉시 재동기화 후 주문 재시도...")
+                self._time_synced = False
+                await self._sync_time_if_needed()
+                return await self.place_order_with_sl(symbol, side, amount, client_id, leverage, sl_price, tp_price, position_side)
             logger.error(f"🚨 [주문 실패] {symbol}: {e}")
             raise e
 
@@ -216,11 +235,24 @@ class ExchangeClient:
             return 0.0
 
     async def fetch_open_positions(self):
-        await self._sync_time_if_needed() # 포지션 조회 전 시계열 확인
+        """바이비트 모든 카테고리(Linear/Inverse/Option)에서 실시간 포지션을 강제 수색합니다."""
         try:
-            positions = await self.exchange.fetch_positions()
-            return [p for p in positions if float(p.get('contracts', 0)) > 0]
-        except: return []
+            all_pos = []
+            for cat in ['linear', 'inverse', 'option']:
+                try:
+                    positions = await self.exchange.fetch_positions(params={'category': cat})
+                    valid = [p for p in positions if abs(float(p.get('contracts', 0))) > 0]
+                    for v in valid:
+                        logger.info(f"📡 [Forensic] 발견된 포지션: {v.get('symbol')} | 수량: {v.get('contracts')} | Side: {v.get('side')}")
+                    all_pos.extend(valid)
+                except: continue
+            return all_pos
+        except Exception as e:
+            if "10002" in str(e):
+                self._time_synced = False
+                await self._sync_time_if_needed()
+                return await self.fetch_open_positions()
+            return []
 
     async def close_position_market(self, symbol, side, amount, client_id, position_side='long'):
         await self._sync_time_if_needed()
