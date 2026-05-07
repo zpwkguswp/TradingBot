@@ -237,11 +237,13 @@ class V33LiveBot:
                             
                             # 트레일링 스탑 체크
                             if pos.get("mfe", 0.0) >= TRAIL_ACT:
-                                if pnl < pos["mfe"] * PRESERVATION_RATIO:
-                                    logger.info(f"💰 [{ticker}] Trailing Stop 발동 (PnL: {pnl*100:.2f}%)")
-                                    await self.exchange.close_position_market(symbol, None, pos["amount"], f"TS_{ticker}", position_side=pos["side"])
-                                    del self.positions[ticker]; self._save_state()
-                                    await self.telegram.send_message(f"💰 **[{ticker}]** 트레일링 스탑 익절! ({pnl*100:.2f}%)")
+                                    if pnl < pos["mfe"] * PRESERVATION_RATIO:
+                                        logger.info(f"💰 [{ticker}] Trailing Stop 발동 (PnL: {pnl*100:.2f}%)")
+                                        # [Surgical Fix] OrderLinkedID 중복 방지: 밀리초 단위 타임스탬프 추가
+                                        order_id = f"TS_{ticker}_{int(time.time()*1000)}"
+                                        await self.exchange.close_position_market(symbol, None, pos["amount"], order_id, position_side=pos["side"])
+                                        del self.positions[ticker]; self._save_state()
+                                        await self.telegram.send_message(f"💰 **[{ticker}]** 트레일링 스탑 익절! ({pnl*100:.2f}%)")
                     
                     # [IMMUTABLE CORE] 마감 전 촘촘한 감시를 위해 5초 대기
                     await asyncio.sleep(5)
@@ -269,8 +271,10 @@ class V33LiveBot:
                             # 롱(Long)을 들고 있는데 AI가 2.0(Short/하락)을 외치면 즉각 도망칩니다!
                             pos = self.positions[ticker]
                             if pos["side"] == "long" and act_val == 2.0:
+                                # [Surgical Fix] OrderLinkedID 중복 방지: 밀리초 단위 타임스탬프 추가
+                                order_id = f"Flip_{ticker}_{int(time.time()*1000)}"
                                 await self.exchange.close_position_market(ticker_to_symbol(ticker),
-                                    None, pos["amount"], f"Flip_{ticker}_{int(time.time())}", position_side=pos["side"])
+                                    None, pos["amount"], order_id, position_side=pos["side"])
                                 del self.positions[ticker]; self._save_state()
                                 await self.telegram.send_message(f"🔴 **[{ticker}]** 하락 위험(2.0) 감지! 롱 포지션 긴급 청산")
 
@@ -283,34 +287,39 @@ class V33LiveBot:
 
                             with th.no_grad():
                                 dist = self.model.policy.get_distribution(obs_tensor)
-                                # Categorical 분포에서 각 액션(0,1,2) 확률표(.probs)를 가져옵니다.
-                                # shape=(1,3), 인덱스 1 = 롱(Long) 확신도
-                                probs = dist.distribution.probs
-                                raw_score = float(probs[0, 1].item())
+                                # [Surgical Fix] 모델 타입(연속형/이산형)에 따른 확신도 추출 대응
+                                if hasattr(dist.distribution, "probs"):
+                                    # V35+ 이산형(Discrete): 1번 인덱스(Long) 확률 (%)
+                                    raw_score = float(dist.distribution.probs[0, 1].item())
+                                    score_label = f"확신도: {raw_score*100:.2f}%"
+                                else:
+                                    # V34 연속형(Box): 분포의 평균값(Mean)을 점수로 사용
+                                    raw_score = float(dist.distribution.mean.item())
+                                    score_label = f"Raw Score: {raw_score:.4f}"
 
-                            candidates.append((ticker, raw_score))
-                            logger.info(f"🎯 [{ticker}] 후보 등록 (Long 확신도: {raw_score*100:.2f}%)") 
+                            candidates.append((ticker, raw_score, score_label))
+                            logger.info(f"🎯 [{ticker}] 후보 등록 ({score_label})") 
 
                     except Exception as e: logger.error(f"[{ticker}] 오류: {e}")
 
                 # ── Phase 2: 최고 확신도 단 1종목에 올인 ──
                 if candidates and len(self.positions) < MAX_POSITIONS:
-                    # [리포트] 상위 5개 후보를 Long 확신도(%) 순으로 정렬하여 보고
+                    # [리포트] 상위 5개 후보를 확신도 순으로 정렬하여 보고
                     sorted_candidates = sorted(candidates, key=lambda x: x[1], reverse=True)
                     top5 = sorted_candidates[:5]
                     
-                    top5_log = "\n".join([f"  {i+1}. {t} | Long 확신도: {s*100:.2f}%" for i, (t, s) in enumerate(top5)])
-                    logger.info(f"📊 [Top-5 Long 확신도 랭킹]\n{top5_log}")
+                    top5_log = "\n".join([f"  {i+1}. {t} | {label}" for i, (t, s, label) in enumerate(top5)])
+                    logger.info(f"📊 [Top-5 확신도 랭킹]\n{top5_log}")
                     
-                    top5_msg = "📊 **[Top-5 Long 확신도 랭킹]**\n" + "\n".join(
-                        [f"{'🥇' if i==0 else '🥈' if i==1 else '🥉' if i==2 else f'{i+1}위'} `{t}` → `{s*100:.2f}%`"
-                         for i, (t, s) in enumerate(top5)]
+                    top5_msg = "📊 **[Top-5 확신도 랭킹]**\n" + "\n".join(
+                        [f"{'🥇' if i==0 else '🥈' if i==1 else '🥉' if i==2 else f'{i+1}위'} `{t}` → `{label}`"
+                         for i, (t, s, label) in enumerate(top5)]
                     )
                     await self.telegram.send_message(top5_msg)
 
-                    best_ticker, best_score = sorted_candidates[0]
-                    logger.info(f"🏆 최고 확신도 타겟: {best_ticker} ({best_score*100:.2f}%) / 후보 {len(candidates)}개 중 선발")
-                    await self.telegram.send_message(f"🔍 **[스캔 완료]** {len(candidates)}개 후보 중 **{best_ticker}** 선발 (Long 확신도: {best_score*100:.2f}%)")
+                    best_ticker, best_score, best_label = sorted_candidates[0]
+                    logger.info(f"🏆 최고 확신도 타겟: {best_ticker} ({best_label}) / 후보 {len(candidates)}개 중 선발")
+                    await self.telegram.send_message(f"🔍 **[스캔 완료]** {len(candidates)}개 후보 중 **{best_ticker}** 선발 ({best_label})")
 
                     try:
                         equity    = await self.exchange.get_total_equity()
@@ -335,18 +344,20 @@ class V33LiveBot:
                                 sl_px  = curr_px - SL_ATR_COEF * atr  # 롱 전용
 
                                 if not self.is_dry_run:
+                                    # [Surgical Fix] OrderLinkedID 중복 방지: 밀리초 단위 타임스탬프 추가
+                                    order_id = f"V34_{best_ticker}_{int(time.time()*1000)}"
                                     order = await self.exchange.place_order_with_sl(
                                         symbol, "buy", amount,
-                                        f"V34_{best_ticker}_{int(time.time())}",
+                                        order_id,
                                         current_leverage, sl_px, position_side="long"
                                     )
                                     if order:
                                         self.positions[best_ticker] = {"side": "long", "amount": amount, "entry_price": curr_px, "entry_timestamp": time.time(), "mfe": 0.0}
                                         self._save_state()
                                         msg = (f"🟢 **[V34 최고확신도 진입]** {best_ticker} @ {curr_px:.4f}\n"
-                                               f"Long 확신도: {best_score*100:.2f}% | 레버리지: {current_leverage}x | 증거금: ${margin:.2f}")
+                                               f"{best_label} | 레버리지: {current_leverage}x | 증거금: ${margin:.2f}")
                                         await self.telegram.send_message(msg)
-                                        logger.info(f"🚀 [{best_ticker}] 사냥 개시! (Long 확신도: {best_score*100:.2f}%)")
+                                        logger.info(f"🚀 [{best_ticker}] 사냥 개시! ({best_label})")
                     except Exception as e:
                         if "110007" in str(e) or "not enough" in str(e).lower():
                             logger.warning(f"💰 [Balance Guard] 진입 실패: 잔고 부족.")

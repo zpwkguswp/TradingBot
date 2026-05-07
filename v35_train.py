@@ -292,8 +292,14 @@ if __name__ == "__main__":
     if os.path.exists(BASE_MODEL):
         print(f"[*] Loading knowledge from V34 Top Model: {BASE_MODEL}")
         _, params, _ = load_from_zip_file(BASE_MODEL, device="cuda")
+        
+        # [Surgical Fix] Action Head(action_net)의 shape 불일치(1 vs 3) 해결
+        # 특징 추출기(Backbone) 등 나머지 가중치만 필터링하여 로드합니다.
+        new_state_dict = {k: v for k, v in params["policy"].items() if "action_net" not in k}
+        
         # strict=False를 통해 구조가 달라진 action_head는 제외하고 특징 추출기만 로드
-        model.policy.load_state_dict(params["policy"], strict=False)
+        model.policy.load_state_dict(new_state_dict, strict=False)
+        print(f"[*] Backbone knowledge transferred successfully. Action head re-initialized for Discrete(3).")
     
     model.save(os.path.join(MODEL_DIR, "v35_baseline_v34_knowledge"))
     
