@@ -28,16 +28,17 @@ warnings.filterwarnings("ignore")
 # ==============================================================================
 MAX_POSITIONS = 1        # 단 1종목 집중 저격 (최고 확신도 올인)
 ALLOCATION_RATE = 0.95   # 가용 잔고의 95% 투입 (수수료 버퍼 5%)
-LEVERAGE = 3             # 하드코딩 레버리지 (동적 레버리지 미사용 시 기본값)
-TARGET_RISK = 0.015      # [Dynamic Leverage] 목표 리스크: BTC 10x 기준 변동성 1.5%
+LEVERAGE = 10             # 하드코딩 레버리지 (동적 레버리지 미사용 시 기본값)
+# TARGET_RISK는 더 이상 고정값으로 사용하지 않습니다 (BTC 실시간 변동성에 연동됨)
 TIMEFRAME = "5m"
 TF_MINUTES = 5
 
-SL_ATR_COEF = 3.835
-TRAIL_ACT = 0.020        # 2% 수익 시 트레일링 스탑 활성화
+SL_ATR_COEF = 5 #3.835
+TRAIL_ACT = 0.010        # 2% 수익 시 트레일링 스탑 활성화, btc10배 기준시 0.01, 3배 기준지 0.02
 PRESERVATION_RATIO = 0.7 # 수익의 70% 보존 (고점 대비 30% 하락 시 익절)
 TARGET_PROFIT = 0.008
 FLIP_PROB_THRESHOLD = 0.70  # [Surgical Edit] 반전 청산 최소 확신도 방어선 (70% 미만 신호는 무시)
+MIN_ENTRANCE_PROB = 0.8    # [Surgical Edit] 진입 문턱: 확신도 98% 이상일 때만 사격 개시
 
 # [V35] Rank 1 Champion (Score 240.7, Step 14,600,000) 적용
 MODEL_PATH = "elite_weights/v35_snapshots/v35_elite_rank_score240.7_step14600000"
@@ -266,26 +267,29 @@ class V35LiveBot:
                 # ── Phase 1: 전 코인 스캔 ──
                 # (ticker, raw_score, score_label, action_type)
                 candidates = []
-                for ticker in FULL_UNIVERSE[:50]:
-                    await asyncio.sleep(0.1)  # API 과속 방지
+                for ticker in FULL_UNIVERSE[:10]:
+                    await asyncio.sleep(2.5)  # API 과속 방지 (Bybit Rate Limit 10006 에러 완벽 차단용 2.5s)
                     if not await self.fetch_missing_5m_data(ticker): continue
                     try:
                         obs = await self.get_v35_observation(ticker)
-                        action, _ = self.model.predict(obs, deterministic=True)
-                        act_val = int(action[0])
+
+                        # [Harness] 모든 코인의 확률을 선제적으로 추출하여 매 5분마다 무조건 로깅
+                        obs_tensor = th.tensor(obs, dtype=th.float32).to(self.model.device)
+                        with th.no_grad():
+                            dist = self.model.policy.get_distribution(obs_tensor)
+                            probs = dist.distribution.probs
+                            prob_hold  = float(probs[0, 0].item())
+                            prob_long  = float(probs[0, 1].item())
+                            prob_short = float(probs[0, 2].item())
+                            
+                        logger.info(f"🔎 [{ticker}] 확률분포 - 관망:{prob_hold*100:.1f}% | 롱:{prob_long*100:.1f}% | 숏:{prob_short*100:.1f}%")
+
+                        # [Surgical Edit] 예측 함수 블랙박스를 피하고, 추출된 확률에서 직접 최고값을 도출
+                        act_val = int(th.argmax(probs, dim=1).item())
 
                         # ── 포지션 반전 청산 로직 (확률 기반 정교화) ──
                         if ticker in self.positions:
                             pos = self.positions[ticker]
-
-                            # [Surgical Edit] 보유 코인의 정확한 방향 확률을 직접 추출
-                            # act_val 기반 Flip은 40%짜리도 청산 → 억울한 손절 위험
-                            obs_tensor_flip = th.tensor(obs, dtype=th.float32).to(self.model.device)
-                            with th.no_grad():
-                                dist_flip = self.model.policy.get_distribution(obs_tensor_flip)
-                                probs_flip = dist_flip.distribution.probs
-                                prob_long  = float(probs_flip[0, 1].item())
-                                prob_short = float(probs_flip[0, 2].item())
 
                             # 롱 보유 중, 숏 확률이 방어선(70%) 초과 시에만 긴급 탈출
                             if pos["side"] == "long" and prob_short > FLIP_PROB_THRESHOLD:
@@ -307,20 +311,14 @@ class V35LiveBot:
 
                         # ── 신규 진입 후보 수집 (슬롯 여유 시) ──
                         elif len(self.positions) < MAX_POSITIONS and act_val in (1, 2):
-                            # [V35 CORE] 이산형 Categorical 분포에서 직접 확신도 추출
-                            obs_tensor = th.tensor(obs, dtype=th.float32).to(self.model.device)
-                            with th.no_grad():
-                                dist = self.model.policy.get_distribution(obs_tensor)
-                                # probs shape=(1,3): [관망, 롱, 숏]
-                                probs = dist.distribution.probs
-                                if act_val == 1:
-                                    raw_score = float(probs[0, 1].item())
-                                    score_label = f"Long 확신도: {raw_score*100:.2f}%"
-                                    action_type = "long"
-                                else:
-                                    raw_score = float(probs[0, 2].item())
-                                    score_label = f"Short 확신도: {raw_score*100:.2f}%"
-                                    action_type = "short"
+                            if act_val == 1:
+                                raw_score = prob_long
+                                score_label = f"Long 확신도: {raw_score*100:.2f}%"
+                                action_type = "long"
+                            else:
+                                raw_score = prob_short
+                                score_label = f"Short 확신도: {raw_score*100:.2f}%"
+                                action_type = "short"
 
                             candidates.append((ticker, raw_score, score_label, action_type))
                             logger.info(f"🎯 [{ticker}] 후보 등록 ({score_label})")
@@ -343,6 +341,14 @@ class V35LiveBot:
                     await self.telegram.send_message(top5_msg)
 
                     best_ticker, best_score, best_label, best_action = sorted_candidates[0]
+                    
+                    # ── [Surgical Edit] 진입 문턱(Confidence Guard) 검사 ──
+                    if best_score < MIN_ENTRANCE_PROB:
+                        msg = f"⚠️ **[관망]** 최고 후보 {best_ticker}({best_score*100:.1f}%)가 진입 문턱({MIN_ENTRANCE_PROB*100:.1f}%)에 미달하여 사격을 중지합니다."
+                        logger.warning(msg)
+                        await self.telegram.send_message(msg)
+                        continue
+
                     logger.info(f"🏆 최고 확신도 타겟: {best_ticker} ({best_label}) / 후보 {len(candidates)}개 중 선발")
                     await self.telegram.send_message(f"🔍 **[스캔 완료]** {len(candidates)}개 후보 중 **{best_ticker}** 선발 ({best_label})")
 
@@ -357,20 +363,31 @@ class V35LiveBot:
                             tick    = await self.exchange.fetch_ticker(symbol)
                             curr_px = float(tick['last'])
 
-                            # ── [1] ATR 선행 계산 ──
+                            # ── [1] 타겟 코인 ATR 계산 ──
                             ohlcv  = await self.exchange.fetch_ohlcv(symbol, "5m", limit=30)
                             df_atr = pd.DataFrame(ohlcv, columns=['t','o','h','l','c','v'])
                             atr    = (df_atr['h'] - df_atr['l']).rolling(14).mean().iloc[-1]
                             atr_pct = atr / (curr_px + 1e-9)  # 현재가 대비 ATR 비율
 
-                            # ── [2] 동적 레버리지 계산 (Risk Parity) ──
-                            # 목표: 모든 코인의 변동성을 TARGET_RISK(1.5%)로 노말라이즈
+                            # ── [2] 동적 레버리지 계산 (BTC 10x Risk Parity) ──
+                            # [IMMUTABLE CORE] 사령관님 지시: BTC는 무조건 10배로 고정. 절대 수정 불가.
+                            # 타 코인들의 레버리지는 BTC 10배 기준 리스크(변동성)에 수학적으로 동기화시킴.
+                            btc_ohlcv = await self.exchange.fetch_ohlcv("BTC/USDT:USDT", "5m", limit=30)
+                            df_btc    = pd.DataFrame(btc_ohlcv, columns=['t','o','h','l','c','v'])
+                            btc_atr   = (df_btc['h'] - df_btc['l']).rolling(14).mean().iloc[-1]
+                            btc_px    = float(df_btc['c'].iloc[-1])
+                            btc_atr_pct = btc_atr / (btc_px + 1e-9)
+
+                            # BTC의 변동성 * 10배 = 시스템 전체의 목표 변동성(Target Risk)
+                            dynamic_target_risk = btc_atr_pct * 10.0
+
                             if atr_pct > 0:
-                                raw_lev = TARGET_RISK / atr_pct
+                                raw_lev = dynamic_target_risk / atr_pct
                                 current_leverage = int(max(1, min(10, round(raw_lev))))
                             else:
                                 current_leverage = LEVERAGE  # fallback
-                            logger.info(f"📈 [Dynamic Lev] ATR%={atr_pct*100:.3f}% → 동적 레버리지: {current_leverage}x")
+
+                            logger.info(f"📈 [Dynamic Lev] BTC 기준 ATR: {btc_atr_pct*100:.3f}% (10x 적용) | 타겟({best_ticker}) ATR: {atr_pct*100:.3f}% → 동적 레버리지: {current_leverage}x")
 
                             # ── [3] 수량 및 손절가 산출 ──
                             raw_amount = (margin * current_leverage) / curr_px
