@@ -53,7 +53,7 @@ STAGE_3_COINS = STAGE_2_COINS + [
     "PENDLEUSDT", "JUPUSDT", "PYTHUSDT", "RENDERUSDT", "FETUSDT",
     "WLDUSDT", "BLURUSDT", "GMXUSDT", "DYDXUSDT", "RUNEUSDT",
     "ATOMUSDT", "ALGOUSDT", "EGLDUSDT", "HBARUSDT", "FLOWUSDT",
-    "RNDRUSDT", "AXSUSDT", "SANDUSDT", "MANAUSDT", "CHZUSDT",
+    "AXSUSDT", "SANDUSDT", "MANAUSDT", "CHZUSDT",
     "APEUSDT", "GALAUSDT", "IMXUSDT", "LRCUSDT", "ZILUSDT",
 ][:50]  # 최대 50개
 
@@ -183,7 +183,7 @@ class TCN6LayerExtractor(BaseFeaturesExtractor):
             nn.AdaptiveAvgPool1d(1),
             nn.Flatten(),
         )
-        n_coins = max(len(FULL_UNIVERSE), 10)
+        n_coins = 100 # [Fix] 고정 크기로 설정하여 코인 리스트 변경 시에도 에러 방지
         self.coin_embedding = nn.Embedding(num_embeddings=n_coins, embedding_dim=16)
         self.fc = nn.Linear(256 + 16, features_dim)
 
