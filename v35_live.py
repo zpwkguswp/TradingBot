@@ -207,6 +207,32 @@ class V35LiveBot:
         del self.positions[ticker]
         self._save_state()
 
+    async def monitor_resources(self):
+        """서버 자원(Disk, RAM)을 감시하고 위험 시 텔레그램 알림을 보냅니다."""
+        try:
+            import psutil
+            # 디스크 체크 (루트 파티션)
+            disk = psutil.disk_usage('/')
+            # 메모리 체크 (Swap 포함 실질 가용량)
+            mem = psutil.virtual_memory()
+            
+            status_msg = (f"📊 **[서버 자원 리포트]**\n"
+                          f"• 디스크: {disk.percent}% 사용 중 ({disk.free/1024**3:.1f}GB 남음)\n"
+                          f"• 메 모 리: {mem.percent}% 사용 중")
+            
+            # 위험 수위 체크 (90% 초과 시)
+            if disk.percent > 90 or mem.percent > 95:
+                warning_msg = f"⚠️ **[위험] 서버 자원 부족 경고!**\n{status_msg}\n관리자의 확인이 필요합니다."
+                logger.warning(warning_msg)
+                await self.telegram.send_message(warning_msg)
+            else:
+                logger.info(f"Healthy: Disk {disk.percent}%, RAM {mem.percent}%")
+                
+            return status_msg
+        except Exception as e:
+            logger.error(f"자원 모니터링 중 오류: {e}")
+            return None
+
     async def run(self):
         print("-------------------------------------------------------")
         print("  V35 Long/Short Sniper Live Engine Starting")
@@ -216,11 +242,21 @@ class V35LiveBot:
         logger.info("📡 순정 텔레그램 통신망 연결 준비 완료.")
         logger.info("🚀 V35 Long/Short Sniper Live Engine Ignition")
 
+        # 부팅 시 첫 리소스 리포트 발송
+        sys_status = await self.monitor_resources()
+        if sys_status:
+            await self.telegram.send_message(f"🚀 **V35 엔진 가동 시작**\n{sys_status}")
+
         # [Harness Protocol] 부팅 즉시 거래소 상황을 강제 입양하여 메모리 일치화
         await self.sync_with_exchange()
 
+        last_resource_check = 0
         while self.is_running:
             try:
+                # 1시간마다 자원 체크
+                if time.time() - last_resource_check > 3600:
+                    await self.monitor_resources()
+                    last_resource_check = time.time()
                 next_close = next_5m_close_unix()
 
                 # [IMMUTABLE CORE] 정각 마감을 끝까지 기다려 훈련장과 동일한 완성된 캔들을 참조합니다.
